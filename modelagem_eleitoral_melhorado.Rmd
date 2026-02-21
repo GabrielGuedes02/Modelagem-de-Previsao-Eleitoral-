@@ -1,0 +1,899 @@
+---
+title: "Modelagem de Previsão Eleitoral no Brasil - Revisão da Literatura"
+author: "Gabriel Guedes Mascarenhas Lopes"
+date: "2026-02-09"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    number_sections: true
+    theme: cosmo
+    css: custom_style.css
+---
+
+```{css, echo=FALSE}
+/* Estilo customizado para o documento */
+body {
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  line-height: 1.6;
+  color: #333;
+}
+
+h1 {
+  color: #2c3e50;
+  border-bottom: 3px solid #3498db;
+  padding-bottom: 10px;
+  margin-top: 30px;
+}
+
+h2 {
+  color: #34495e;
+  border-left: 4px solid #3498db;
+  padding-left: 15px;
+  margin-top: 25px;
+}
+
+h3 {
+  color: #7f8c8d;
+  font-style: italic;
+}
+
+table {
+  margin: 20px auto;
+  border-collapse: collapse;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+  width: 90%;
+}
+
+thead {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+}
+
+thead th {
+  padding: 12px;
+  font-weight: 600;
+  text-align: center;
+}
+
+tbody td {
+  padding: 10px;
+  text-align: center;
+  border-bottom: 1px solid #ecf0f1;
+}
+
+tbody tr:hover {
+  background-color: #f8f9fa;
+  transition: background-color 0.3s ease;
+}
+
+.destaque-2026 {
+  background-color: #fff3cd !important;
+  font-weight: bold;
+}
+
+.formula-box {
+  background-color: #f8f9fa;
+  border-left: 4px solid #3498db;
+  padding: 15px;
+  margin: 20px 0;
+  border-radius: 4px;
+}
+
+.nota-rodape {
+  font-size: 0.9em;
+  color: #7f8c8d;
+  font-style: italic;
+  margin-top: 10px;
+}
+
+.resultados-section {
+  background: linear-gradient(to right, #f8f9fa, #ffffff);
+  padding: 20px;
+  border-radius: 8px;
+  margin: 20px 0;
+}
+```
+
+# Base de Dados
+
+A base de dados utilizada foi construída a partir das seguintes fontes:
+
+-   **Tribunal Superior Eleitoral (TSE)**: percentuais de votos válidos por Unidade da Federação. Foi utilizada a biblioteca electionBR;
+-   **IBGE / Ministério do Desenvolvimento Social**: Índice Bolsa Família (IBF); Percentual de domicílios que recebem bolsa família reitrado do site do IBGE;
+-   **Datafolha** / Popularidade do Candidato Incumbente
+
+------------------------------------------------------------------------
+
+```{r Bibliotecas, message=FALSE, warning=FALSE, include=FALSE}
+library(tidyverse)
+library(janitor)
+library(here)
+library(rio)
+library(fixest)
+library(plm)
+library(clubSandwich)
+library(wooldridge)
+library(knitr)
+library(kableExtra)
+```
+
+```{r Dados1, echo=FALSE, message=FALSE, warning=FALSE}
+Dados <- import(here("BaseDados1.csv")) %>% filter(SG_UF != "VT") %>% filter(Ano != 2024) %>% select(4:9)
+
+glimpse(Dados)
+```
+
+```{r Abramovitz,echo = FALSE, message=FALSE, warning=FALSE, include=FALSE}
+BaseDados <- import(here("BaseDados1.csv")) %>% filter(SG_UF != "VT") %>% filter(Ano != 2024)
+
+#Dummy
+BaseDados <- BaseDados %>%
+  mutate(
+    third_term = ifelse(Ano %in% c(2002, 2010), 1, 0)
+  )
+
+#Populacao Censo 2022
+pop_uf <- tibble(
+  SG_UF = c("AC","AL","AM","AP","BA","CE","DF","ES","GO","MA",
+            "MG","MS","MT","PA","PB","PE","PI","PR","RJ","RN",
+            "RO","RR","RS","SC","SE","SP","TO"),
+  pop = c(830026, 3351543, 4144597, 877613, 14873064, 9132078,
+          3055149, 4064052, 7018354, 7114598, 21168791, 2778986,
+          3526220, 8690745, 4039277, 9557071, 3273227, 11433957,
+          17264943, 3560903, 1777225, 652713, 11422973, 7610361,
+          2318822, 45919049, 1590248)
+)
+
+#Juntando
+BaseDados <- BaseDados %>%
+  left_join(pop_uf, by = "SG_UF") %>%
+  mutate(weight = pop / sum(pop))
+
+# Definir estrutura de painel
+BaseDados <- pdata.frame(
+  BaseDados,
+  index = c("SG_UF", "Ano")
+)
+
+# Random Effects GLS + erros clusterizados por estado
+# 1. Ajustar escala para porcentagem (0-100) para bater com a Tabela 3 do artigo
+BaseDados <- BaseDados %>%
+  mutate(
+    voto_inc_pct = voto_inc * 100,
+    # Normalizar pesos: a soma dos pesos deve ser igual ao número de observações
+    weight_norm = pop / mean(pop) 
+  )
+
+# 2. Re-estimar o Random Effects GLS
+modelo_gls_final <- plm(
+  voto_inc_pct ~ Var + Inc_Aprov + third_term, 
+  data    = BaseDados, 
+  index   = c("SG_UF", "Ano"), 
+  model   = "random",
+  weights = weight_norm
+)
+
+# 3. Inferência Robusta (CR2)
+coef_test(modelo_gls_final, vcov = "CR2", cluster = "individual")
+
+# Capacidade Preditiva
+# 1. Gerar as predições (valores ajustados) para cada estado e ano
+BaseDados$y_hat_gls <- predict(modelo_gls_final, newdata = BaseDados)
+
+# 2. Calcular a média ponderada nacional por ano
+previsoes_gls_Abramovitz <- BaseDados %>%
+  group_by(Ano) %>%
+  summarise(
+    previsto = sum(y_hat_gls * pop, na.rm = TRUE) / sum(pop, na.rm = TRUE),
+    observado = sum(voto_inc_pct * pop, na.rm = TRUE) / sum(pop, na.rm = TRUE)
+  )
+
+# Previsão 2026
+# 1. Calcular a média histórica de crescimento de cada estado (Var médio)
+hist_stats <- BaseDados %>%
+  group_by(SG_UF) %>%
+  summarise(mean_var_estado = mean(Var, na.rm = TRUE))
+
+# 2. Calcular a média das médias (o crescimento "médio" de um estado no Brasil)
+media_simples_nacional <- mean(hist_stats$mean_var_estado)
+
+# 3. Calcular o Fator de Participação
+hist_stats <- hist_stats %>%
+  mutate(
+    fator_participacao = mean_var_estado / media_simples_nacional
+  )
+
+# 4. Criar a base fictícia para 2026
+Base_2026 <- hist_stats %>%
+  mutate(
+    Ano = 2026,
+    Var = 2.6 * fator_participacao,
+    Inc_Aprov = 33,
+    third_term = 0
+  ) %>%
+  select(SG_UF, Ano, Var, Inc_Aprov, third_term)
+
+# Definindo os coeficientes
+b0 <- 30.9336
+b1 <- -0.0286
+b2 <- 50.9984
+b3 <- -21.4809
+
+Base_2026 <- Base_2026 %>%
+  mutate(SG_UF = as.character(SG_UF)) %>%
+  left_join(pop_uf, by = "SG_UF") %>%
+  mutate(
+    voto_estimado = b0 + (b1 * Var) + (b2 * 0.40) + (b3 * 0)
+  )
+
+# Previsão nacional ponderada
+previsao_2026_Abramovitz <- sum(Base_2026$voto_estimado * Base_2026$pop, na.rm = TRUE) / sum(Base_2026$pop, na.rm = TRUE)
+```
+
+```{r Lewis, echo = FALSE, warning=FALSE,include=FALSE, messsage = FALSE}
+Base1 <- import(here("BaseDados1.csv")) %>% filter(SG_UF != "VT")  %>% filter(Ano != 2024)
+
+#Populacao Censo 2022
+pop_uf <- tibble(
+  SG_UF = c("AC","AL","AM","AP","BA","CE","DF","ES","GO","MA",
+            "MG","MS","MT","PA","PB","PE","PI","PR","RJ","RN",
+            "RO","RR","RS","SC","SE","SP","TO"),
+  pop = c(830026, 3351543, 4144597, 877613, 14873064, 9132078,
+          3055149, 4064052, 7018354, 7114598, 21168791, 2778986,
+          3526220, 8690745, 4039277, 9557071, 3273227, 11433957,
+          17264943, 3560903, 1777225, 652713, 11422973, 7610361,
+          2318822, 45919049, 1590248)
+)
+
+#Juntando
+Base1 <- Base1 %>%
+  left_join(pop_uf, by = "SG_UF") %>%
+  mutate(weight = pop / sum(pop))
+
+# Definir estrutura de painel
+Base1 <- pdata.frame(
+  Base1,
+  index = c("SG_UF", "Ano")
+)
+
+# Random Effects GLS + erros clusterizados por estado
+# 1. Ajustar escala para porcentagem (0-100) para bater com a Tabela 3 do artigo
+Base1 <- Base1 %>%
+  mutate(
+    voto_inc_pct = voto_inc * 100,
+    weight_norm = pop / mean(pop) 
+  )
+
+# 2. Re-estimar o Random Effects GLS
+modelo_gls_final <- plm(
+  voto_inc_pct ~ Var + Inc_Aprov ,
+  data    = Base1, 
+  index   = c("SG_UF", "Ano"), 
+  model   = "random",
+  weights = weight_norm
+)
+
+# 3. Inferência Robusta (CR2)
+coef_test(modelo_gls_final, vcov = "CR2", cluster = "individual")
+
+# Capacidade Preditiva
+Base1$y_hat_gls <- predict(modelo_gls_final, newdata = Base1)
+
+previsoes_gls <- Base1 %>%
+  group_by(Ano) %>%
+  summarise(
+    previsto = sum(y_hat_gls * pop, na.rm = TRUE) / sum(pop, na.rm = TRUE),
+    observado = sum(voto_inc_pct * pop, na.rm = TRUE) / sum(pop, na.rm = TRUE)
+  )
+
+# Previsao 2026
+hist_stats <- Base1 %>%
+  group_by(SG_UF) %>%
+  summarise(
+    mean_var_estado = mean(Var, na.rm = TRUE),
+    pop = last(pop) 
+  )
+
+media_simples_nacional <- mean(hist_stats$mean_var_estado)
+
+hist_stats <- hist_stats %>%
+  mutate(
+    fator_participacao = mean_var_estado / media_simples_nacional
+  )
+
+Base_2026 <- hist_stats %>%
+  mutate(
+    Ano = 2026,
+    Var = 2.6 * fator_participacao,
+    Inc_Aprov = 0.33
+  )
+
+# Definindo os novos coeficientes
+b0 <- 33.2740
+b1 <- 0.0121
+b2 <- 27.6249
+
+Base_2026 <- Base_2026 %>%
+  mutate(
+    voto_estimado = b0 + (b1 * Var) + (b2 * Inc_Aprov)
+  )
+
+previsao_2026_Lewis <- sum(Base_2026$voto_estimado * Base_2026$pop, na.rm = TRUE) / sum(Base_2026$pop, na.rm = TRUE)
+```
+
+```{r Lins, echo = FALSE, warning=FALSE, include=FALSE, message=FALSE}
+Dados <- import(here("BaseDados1.csv")) %>% mutate(
+    voto_inc_pct = voto_inc * 100)
+
+pop_uf <- tibble(
+  SG_UF = c("AC","AL","AM","AP","BA","CE","DF","ES","GO","MA",
+            "MG","MS","MT","PA","PB","PE","PI","PR","RJ","RN",
+            "RO","RR","RS","SC","SE","SP","TO"),
+  pop = c(830026, 3351543, 4144597, 877613, 14873064, 9132078,
+          3055149, 4064052, 7018354, 7114598, 21168791, 2778986,
+          3526220, 8690745, 4039277, 9557071, 3273227, 11433957,
+          17264943, 3560903, 1777225, 652713, 11422973, 7610361,
+          2318822, 45919049, 1590248)
+)
+
+#Juntando
+Dados <- Dados %>%
+  left_join(pop_uf, by = "SG_UF") %>%
+  mutate(weight = pop / sum(pop))
+
+# 2018
+Dados2018 <- Dados %>%
+  filter(Ano == 2018)
+
+Dados2018 <- Dados2018 %>%
+  mutate(IBF = as.numeric(as.character(IBF)))
+
+Reg_2018 <- lm(voto_inc_pct ~ IBF, data = Dados2018)
+
+# Adicionando Previsão na Base
+Dados2018$previsao_2018 <- predict(
+  Reg_2018,
+  newdata = Dados2018
+)
+
+# Previsão
+previsao_2018_pbf <- Dados2018 %>%
+  summarise(
+    voto_haddad_nacional =
+      sum(previsao_2018 * pop, na.rm = TRUE) /
+      sum(pop, na.rm = TRUE)
+  )
+
+observado_2018_pbf <- Dados2018 %>%
+  summarise(
+    voto_haddad_nacional =
+      sum(voto_inc_pct * pop, na.rm = TRUE) /
+      sum(pop, na.rm = TRUE)
+  ) 
+
+# 2022
+Dados2022 <- Dados %>%
+  filter(Ano == 2022)
+
+Dados2022 <- Dados2022 %>%
+  mutate(IBF = as.numeric(as.character(IBF)))
+
+Reg_2022 <- lm(voto_inc_pct ~ IBF, data = Dados2022)
+
+# Adicionando Previsão na Base
+Dados2022$previsao_2022 <- predict(
+  Reg_2022,
+  newdata = Dados2022
+)
+
+# Previsão
+previsao_2022_pbf <- Dados2022 %>%
+  summarise(
+    voto_bolsonaro_nacional =
+      sum(previsao_2022 * pop, na.rm = TRUE) /
+      sum(pop, na.rm = TRUE)
+  )
+
+observado_2022_pbf <- Dados2022 %>%
+  summarise(
+    voto_bolsonaro_nacional =
+      sum(voto_inc_pct * pop, na.rm = TRUE) /
+      sum(pop, na.rm = TRUE)
+  ) 
+
+# Previsão 2026
+IBF_2024 <- Dados %>%
+  filter(Ano == 2024) %>%
+  select(SG_UF, IBF_2024 = IBF) %>%
+  mutate(
+    IBF_2024 = as.numeric(IBF_2024)
+  )
+
+Dados2026 <- Dados %>%
+  filter(Ano == 2024) %>%
+  left_join(IBF_2024, by = "SG_UF") %>%
+  mutate(
+    IBF = IBF_2024
+  ) %>%
+  select(-IBF_2024)
+
+Dados2026$previsao_lula_2026 <- predict(
+  Reg_2022,
+  newdata = Dados2026
+)
+
+PrevisaoPBF  <- Dados2026 %>%
+  summarise(
+    voto_lula_nacional = weighted.mean(
+      previsao_lula_2026,
+      pop,
+      na.rm = TRUE
+    )
+  )
+```
+
+```{r Tabela, warning=FALSE, include=FALSE}
+library(tidyverse)
+library(janitor)
+
+observados <- bind_rows(
+  observado_2018_pbf %>%
+    transmute(
+      Ano = 2018,
+      Tipo = "Observado",
+      Modelo = "Resultado Eleitoral",
+      valor = voto_haddad_nacional
+    ),
+  
+  observado_2022_pbf %>%
+    transmute(
+      Ano = 2022,
+      Tipo = "Observado",
+      Modelo = "Resultado Eleitoral",
+      valor = voto_bolsonaro_nacional
+    )
+)
+
+prev_gls_lewis <- previsoes_gls %>%
+  filter(Ano %in% c(2018, 2022)) %>%
+  transmute(
+    Ano,
+    Tipo = "Previsto",
+    Modelo = "GLS Lewis",
+    valor = previsto
+  )
+
+prev_gls_abramovitz <- previsoes_gls_Abramovitz %>%
+  filter(Ano %in% c(2018, 2022)) %>%
+  transmute(
+    Ano,
+    Tipo = "Previsto",
+    Modelo = "GLS Abramovitz",
+    valor = previsto
+  )
+
+prev_pbf <- bind_rows(
+  previsao_2018_pbf %>%
+    transmute(
+      Ano = 2018,
+      Tipo = "Previsto",
+      Modelo = "IBF / Bolsa Família",
+      valor = voto_haddad_nacional
+    ),
+  
+  previsao_2022_pbf %>%
+    transmute(
+      Ano = 2022,
+      Tipo = "Previsto",
+      Modelo = "IBF / Bolsa Família",
+      valor = voto_bolsonaro_nacional
+    )
+)
+
+prev_2026 <- tibble(
+  Ano = 2026,
+  Tipo = "Previsão",
+  Modelo = c(
+    "GLS Lewis",
+    "GLS Abramovitz",
+    "IBF / Bolsa Família"
+  ),
+  valor = c(
+    previsao_2026_Lewis,
+    previsao_2026_Abramovitz,
+    PrevisaoPBF$voto_lula_nacional
+  )
+)
+
+# Garantir que Ano NÃO seja pseries em nenhum objeto
+observados <- observados %>% mutate(Ano = as.numeric(Ano))
+prev_gls_lewis <- prev_gls_lewis %>% mutate(Ano = as.numeric(Ano))
+prev_gls_abramovitz <- prev_gls_abramovitz %>% mutate(Ano = as.numeric(Ano))
+prev_pbf <- prev_pbf %>% mutate(Ano = as.numeric(Ano))
+prev_2026 <- prev_2026 %>% mutate(Ano = as.numeric(Ano))
+
+# Tabela final longa
+tabela_final <- bind_rows(
+  observados,
+  prev_gls_lewis,
+  prev_gls_abramovitz,
+  prev_pbf,
+  prev_2026
+) %>%
+  mutate(valor = round(valor, 2)) %>%
+  arrange(Ano, Tipo, Modelo)
+
+tabela_final <- tabela_final %>%
+  mutate(
+    Ano = case_when(
+      Ano == 7 ~ 2018,
+      Ano == 8 ~ 2022,
+      TRUE ~ Ano
+    )
+  ) %>%
+  arrange(Ano, Tipo, Modelo)
+
+# CORREÇÃO: Criar tabela pivotada SEM incluir observado para 2026
+tabela_modelos_por_ano <- tabela_final %>%
+  mutate(
+    Modelo = case_when(
+      Modelo == "Resultado Eleitoral" ~ "Observado",
+      Modelo == "GLS Abramovitz" ~ "Previsão Abramovitz",
+      Modelo == "GLS Lewis" ~ "Previsão Lewis",
+      Modelo == "IBF / Bolsa Família" ~ "Previsão R. Lins",
+      TRUE ~ Modelo
+    )
+  ) %>%
+  select(Ano, Modelo, valor) %>%
+  pivot_wider(
+    names_from = Modelo,
+    values_from = valor
+  ) %>%
+  arrange(Ano) %>%
+  # Substituir NA por "-" apenas na coluna Observado
+  mutate(
+    Observado = ifelse(is.na(Observado), "-", as.character(round(Observado, 2)))
+  )
+```
+
+<div class="resultados-section">
+
+# Resultados e Extrapolação para 2026
+
+As previsões eleitorais apresentadas neste trabalho seguem o conceito de **previsão condicional** conforme definido por Wooldridge (2016), em *Introdução à Econometria*. Nesse arcabouço, a previsão do valor esperado da variável dependente é obtida **condicionalmente aos valores assumidos pelas variáveis explicativas**, utilizando os coeficientes estimados do modelo populacional aproximado.
+
+<div class="formula-box">
+Formalmente, dada a especificação geral:
+
+$$y_i = \beta_0 + \beta_1 X_{1i} + \beta_2 X_{2i} + \cdots + u_i$$
+
+a previsão condicional é definida como:
+
+$$\widehat{E}(y_i \mid X_i) = \hat{\beta}_0 + \hat{\beta}_1 X_{1i} + \hat{\beta}_2 X_{2i} + \cdots$$
+
+Ou seja, a previsão utiliza **valores observados ou projetados dos regressores**, mantendo fixos os coeficientes estimados a partir dos dados históricos.
+</div>
+
+<p class="nota-rodape">
+**Nota:** Utiliza-se a projeção de 2.6% de crescimento do PIB em 2026, e 30% de Ótimo/Bom na Avaliação do Candidato Mandatário.
+</p>
+
+</div>
+
+---
+
+```{r Dados, echo = FALSE, warning = FALSE, message = FALSE}
+library(knitr)
+library(kableExtra)
+
+tabela_modelos_por_ano %>%
+  kable(
+    format = "html",
+    col.names = c(
+      "Ano",
+      "Observado",
+      "Previsão Abramovitz (2008)",
+      "Previsão Lewis-Beck (2008)",
+      "Previsão R. Lins (2016)"
+    ),
+    align = "c",
+    caption = "Resultado observado e previsões eleitorais por modelo",
+    escape = FALSE
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    position = "center",
+    font_size = 14
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#667eea") %>%
+  row_spec(3, background = "#fff3cd", bold = TRUE) %>%
+  column_spec(1, bold = TRUE, width = "10%") %>%
+  column_spec(2:5, width = "20%")
+```
+
+# Especificação Formal dos Modelos
+
+Esta seção apresenta a formulação econométrica dos modelos estimados, utilizando notação padrão em LaTeX para explicitar as relações entre as variáveis.
+
+## Modelo Abramovitz (2008)
+
+O modelo de Abramovitz (2008) é especificado como um modelo de dados em painel com efeitos aleatórios, no qual o desempenho eleitoral do incumbente em cada estado depende do crescimento econômico, da aprovação do governo e de um efeito institucional capturado por uma variável dummy:
+
+$$V_{it} = \alpha + \beta_1 \, \text{Var}_{it} + \beta_2 \, \text{IncAprov}_{t} + \gamma \, D_t + u_i + \varepsilon_{it}$$
+
+onde:
+
+- $V_{it}$ representa o percentual de votos do incumbente no estado $i$ na eleição $t$;
+- $\text{Var}_{it}$ é a taxa de crescimento econômico estadual no período pré-eleitoral;
+- $\text{IncAprov}_{t}$ indica o nível de aprovação do governo federal;
+- $D_t$ é uma variável dummy que assume valor 1 se o partido do candidato incumbente está tentando a 3ª reeleição, e 0 caso contrário;
+- $u_i \sim \mathcal{N}(0, \sigma_u^2)$ representa o efeito aleatório específico do estado;
+- $\varepsilon_{it} \sim \mathcal{N}(0, \sigma_\varepsilon^2)$ é o erro idiossincrático.
+
+A estimação é realizada por Mínimos Quadrados Generalizados (GLS), com ponderação populacional e erros-padrão robustos e clusterizados por unidade da federação.
+
+---
+
+## Modelo Lewis-Beck (2008)
+
+O modelo de Lewis-Beck (2008) segue a tradição dos modelos de voto econômico retrospectivo e não incorpora variáveis institucionais adicionais, focando exclusivamente nos fundamentos econômicos e de avaliação governamental:
+
+$$V_{it} = \alpha + \beta_1 \, \text{Var}_{it} + \beta_2 \, \text{IncAprov}_{t} + u_i + \varepsilon_{it}$$
+
+em que:
+
+- os termos e variáveis são definidos como anteriormente;
+- $u_i$ captura heterogeneidade não observada entre os estados.
+
+Este modelo é estimado via GLS com efeitos aleatórios, garantindo comparabilidade com a especificação de Abramovitz, mas mantendo uma estrutura mais parcimoniosa.
+
+---
+
+## Modelo R. Lins (2016)
+
+O modelo de R. Lins (2016) adota uma abordagem cross-section e relaciona o desempenho eleitoral do incumbente à intensidade das políticas de transferência de renda:
+
+$$V_i = \alpha + \delta \, \text{IBF}_i + \varepsilon_i$$
+
+onde:
+
+- $V_i$ representa o percentual de votos do incumbente no estado $i$;
+- $\text{IBF}_i$ é o Índice Bolsa Família no estado $i$;
+- $\varepsilon_i$ é o termo de erro aleatório.
+
+O modelo é estimado separadamente para cada eleição por Mínimos Quadrados Ordinários (MQO).
+
+---
+
+## Agregação Nacional das Previsões
+
+A previsão nacional do desempenho eleitoral do incumbente é obtida a partir da média ponderada das previsões estaduais geradas por cada modelo:
+
+$$\widehat{V}_t^{\,\text{Nacional}} = \frac{\sum_{i=1}^{N} \widehat{V}_{it} \cdot \text{Pop}_i}{\sum_{i=1}^{N} \text{Pop}_i}$$
+
+onde $\text{Pop}_i$ representa a população do estado $i$, conforme o Censo Demográfico de 2022.
+
+## Análise Estatística dos Modelos
+
+Esta seção apresenta e interpreta os resultados das estimações econométricas dos modelos de previsão eleitoral utilizados no estudo. A análise enfatiza a magnitude dos coeficientes, sua significância estatística e a coerência substantiva com a literatura de voto econômico e redistributivo.
+
+### Modelo Lewis-Beck (2008)
+
+```{r LewisS, echo=FALSE, message=FALSE,warning=FALSE}
+
+Base1 <- import(here("BaseDados1.csv")) %>% filter(SG_UF != "VT")  %>% filter(Ano != 2024)
+
+#Populacao Censo 2022
+pop_uf <- tibble(
+  SG_UF = c("AC","AL","AM","AP","BA","CE","DF","ES","GO","MA",
+            "MG","MS","MT","PA","PB","PE","PI","PR","RJ","RN",
+            "RO","RR","RS","SC","SE","SP","TO"),
+  pop = c(830026, 3351543, 4144597, 877613, 14873064, 9132078,
+          3055149, 4064052, 7018354, 7114598, 21168791, 2778986,
+          3526220, 8690745, 4039277, 9557071, 3273227, 11433957,
+          17264943, 3560903, 1777225, 652713, 11422973, 7610361,
+          2318822, 45919049, 1590248)
+)
+
+#Juntando
+Base1 <- Base1 %>%
+  left_join(pop_uf, by = "SG_UF") %>%
+  mutate(weight = pop / sum(pop))
+
+# Definir estrutura de painel
+Base1 <- pdata.frame(
+  Base1,
+  index = c("SG_UF", "Ano")
+)
+
+# Random Effects GLS + erros clusterizados por estado
+# 1. Ajustar escala para porcentagem (0-100) para bater com a Tabela 3 do artigo
+Base1 <- Base1 %>%
+  mutate(
+    voto_inc_pct = voto_inc * 100,
+    weight_norm = pop / mean(pop) 
+  )
+
+# 2. Re-estimar o Random Effects GLS
+modelo_gls_final <- plm(
+  voto_inc_pct ~ Var + Inc_Aprov ,
+  data    = Base1, 
+  index   = c("SG_UF", "Ano"), 
+  model   = "random",
+  weights = weight_norm
+)
+
+# 3. Inferência Robusta (CR2)
+coef_test(modelo_gls_final, vcov = "CR2", cluster = "individual")
+
+```
+
+O modelo de Lewis-Beck é estimado por Mínimos Quadrados Generalizados (GLS) com efeitos aleatórios e erros-padrão robustos clusterizados por unidade da federação. Os resultados indicam que a aprovação do governo exerce forte impacto positivo sobre o desempenho eleitoral do incumbente, enquanto o crescimento econômico estadual não apresenta efeito estatisticamente significativo.
+
+O coeficiente associado à variável de aprovação do governo ($\text{IncAprov}$) é positivo e estatisticamente significativo ao nível de 1% ($\hat{\beta}_2 = 27{,}62$, $p < 0{,}001$). Substantivamente, esse resultado sugere que um aumento de 10 pontos percentuais na aprovação presidencial está associado a um incremento aproximado de 2,8 pontos percentuais no voto do incumbente.
+
+Por outro lado, a taxa de crescimento econômico ($\text{Var}$) apresenta coeficiente próximo de zero e estatisticamente indistinguível de zero ($\hat{\beta}_1 = 0{,}012$, $p = 0{,}959$), indicando ausência de evidência empírica de voto econômico retrospectivo baseado no crescimento estadual quando a aprovação governamental é controlada.
+
+O intercepto do modelo é estatisticamente significativo ($\hat{\alpha} = 33{,}27$, $p < 0{,}001$), representando o patamar médio de votos do incumbente na ausência dos efeitos explicativos.
+
+---
+
+### Modelo Abramovitz (2008)
+
+
+```{r AbramovitzS, echo=FALSE, message=FALSE,warning=FALSE}
+
+BaseDados <- import(here("BaseDados1.csv")) %>% filter(SG_UF != "VT") %>% filter(Ano != 2024)
+
+#Dummy
+BaseDados <- BaseDados %>%
+  mutate(
+    third_term = ifelse(Ano %in% c(2002, 2010), 1, 0)
+  )
+
+#Populacao Censo 2022
+pop_uf <- tibble(
+  SG_UF = c("AC","AL","AM","AP","BA","CE","DF","ES","GO","MA",
+            "MG","MS","MT","PA","PB","PE","PI","PR","RJ","RN",
+            "RO","RR","RS","SC","SE","SP","TO"),
+  pop = c(830026, 3351543, 4144597, 877613, 14873064, 9132078,
+          3055149, 4064052, 7018354, 7114598, 21168791, 2778986,
+          3526220, 8690745, 4039277, 9557071, 3273227, 11433957,
+          17264943, 3560903, 1777225, 652713, 11422973, 7610361,
+          2318822, 45919049, 1590248)
+)
+
+#Juntando
+BaseDados <- BaseDados %>%
+  left_join(pop_uf, by = "SG_UF") %>%
+  mutate(weight = pop / sum(pop))
+
+# Definir estrutura de painel
+BaseDados <- pdata.frame(
+  BaseDados,
+  index = c("SG_UF", "Ano")
+)
+
+# Random Effects GLS + erros clusterizados por estado
+# 1. Ajustar escala para porcentagem (0-100) para bater com a Tabela 3 do artigo
+BaseDados <- BaseDados %>%
+  mutate(
+    voto_inc_pct = voto_inc * 100,
+    # Normalizar pesos: a soma dos pesos deve ser igual ao número de observações
+    weight_norm = pop / mean(pop) 
+  )
+
+# 2. Re-estimar o Random Effects GLS
+modelo_gls_final <- plm(
+  voto_inc_pct ~ Var + Inc_Aprov + third_term, 
+  data    = BaseDados, 
+  index   = c("SG_UF", "Ano"), 
+  model   = "random",
+  weights = weight_norm
+)
+
+# 3. Inferência Robusta (CR2)
+coef_test(modelo_gls_final, vcov = "CR2", cluster = "individual")
+
+```
+
+O modelo de Abramovitz amplia a especificação de Lewis-Beck ao incorporar uma variável dummy institucional ($\text{third\_term}$), capturando efeitos associados a contextos eleitorais específicos. Assim como no modelo anterior, a estimação é realizada por GLS com efeitos aleatórios e inferência robusta.
+
+Os resultados mostram que a aprovação presidencial exerce impacto positivo expressivo e altamente significativo ($\hat{\beta}_2 = 50{,}99$, $p < 0{,}001$), com magnitude substancialmente superior à observada no modelo de Lewis-Beck. Esse achado reforça a centralidade da avaliação governamental como principal determinante do voto incumbente.
+
+A variável de crescimento econômico estadual novamente não apresenta efeito estatisticamente significativo ($\hat{\beta}_1 = -0{,}0286$, $p = 0{,}885$), corroborando a evidência de que o crescimento econômico, isoladamente, não explica variações no voto governista no período analisado.
+
+A dummy institucional ($\text{third\_term}$) apresenta coeficiente negativo, elevado em magnitude e estatisticamente significativo ($\hat{\gamma} = -21{,}48$, $p < 0{,}001$). Esse resultado indica que eleições associadas a contextos de desgaste institucional ou continuidade prolongada do poder impõem penalidade eleitoral relevante ao incumbente, mesmo após o controle por aprovação e crescimento econômico.
+
+---
+
+### Modelo R. Lins (2016) – Transferências Sociais
+
+```{r LinsS, echo = FALSE, message=FALSE, warning=FALSE}
+
+Dados <- import(here("BaseDados1.csv")) %>% mutate(
+    voto_inc_pct = voto_inc * 100)
+
+pop_uf <- tibble(
+  SG_UF = c("AC","AL","AM","AP","BA","CE","DF","ES","GO","MA",
+            "MG","MS","MT","PA","PB","PE","PI","PR","RJ","RN",
+            "RO","RR","RS","SC","SE","SP","TO"),
+  pop = c(830026, 3351543, 4144597, 877613, 14873064, 9132078,
+          3055149, 4064052, 7018354, 7114598, 21168791, 2778986,
+          3526220, 8690745, 4039277, 9557071, 3273227, 11433957,
+          17264943, 3560903, 1777225, 652713, 11422973, 7610361,
+          2318822, 45919049, 1590248)
+)
+
+#Juntando
+Dados <- Dados %>%
+  left_join(pop_uf, by = "SG_UF") %>%
+  mutate(weight = pop / sum(pop))
+
+# 2018
+Dados2018 <- Dados %>%
+  filter(Ano == 2018)
+
+Dados2018 <- Dados2018 %>%
+  mutate(IBF = as.numeric(as.character(IBF)))
+
+Reg_2018 <- lm(voto_inc_pct ~ IBF, data = Dados2018)
+
+# Adicionando Previsão na Base
+Dados2018$previsao_2018 <- predict(
+  Reg_2018,
+  newdata = Dados2018
+)
+
+# Previsão
+previsao_2018_pbf <- Dados2018 %>%
+  summarise(
+    voto_haddad_nacional =
+      sum(previsao_2018 * pop, na.rm = TRUE) /
+      sum(pop, na.rm = TRUE)
+  )
+
+observado_2018_pbf <- Dados2018 %>%
+  summarise(
+    voto_haddad_nacional =
+      sum(voto_inc_pct * pop, na.rm = TRUE) /
+      sum(pop, na.rm = TRUE)
+  ) 
+
+# 2022
+Dados2022 <- Dados %>%
+  filter(Ano == 2022)
+
+Dados2022 <- Dados2022 %>%
+  mutate(IBF = as.numeric(as.character(IBF)))
+
+Reg_2022 <- lm(voto_inc_pct ~ IBF, data = Dados2022)
+
+summary(Reg_2022)
+
+```
+
+O modelo de R. Lins (2016) é estimado por Mínimos Quadrados Ordinários (MQO) em corte transversal para a eleição de 2022, relacionando o percentual de votos do incumbente ao Índice Bolsa Família (IBF).
+
+Os resultados revelam uma associação negativa e estatisticamente significativa entre o IBF e o voto do incumbente ($\hat{\delta} = -0{,}81$, $p < 0{,}001$). Substantivamente, o coeficiente indica que um aumento de um ponto no IBF estadual está associado a uma redução média de aproximadamente 0,8 ponto percentual no voto governista.
+
+O intercepto do modelo é positivo e estatisticamente significativo ($\hat{\alpha} = 63{,}49$, $p < 0{,}001$), refletindo o patamar médio de votos do incumbente em estados com baixa intensidade do programa de transferência de renda.
+
+O modelo apresenta coeficiente de determinação relativamente elevado para um modelo univariado ($R^2 = 0{,}48$), indicando que quase metade da variação interestadual do voto incumbente em 2022 é explicada pela intensidade do Bolsa Família.
+
+---
+
+## Capacidade Preditiva - Autores
+
+### Renno 2022
+```{r img1, echo=FALSE, fig.align="center", out.width="60%"}
+knitr::include_graphics("C:/Users/guede/OneDrive/Documentos/Quaest/Modelagem/Tabela - Renno2022.png")
+```
+
+### R. Lins 2016
+```{r img, echo=FALSE, fig.align="center", out.width="60%"}
+knitr::include_graphics("C:/Users/guede/OneDrive/Documentos/Quaest/Modelagem/Tabela - R.Lins.png")
+```
