@@ -107,6 +107,3 @@ $$\widehat{V}_t^{\text{National}} = \frac{\sum_{i=1}^{N} \widehat{V}_{it} \cdot 
 - The **third-term dummy** (Abramovitz model) is negative and significant, suggesting an electoral penalty for prolonged institutional continuity.
 - The **Bolsa Família Index** is negatively associated with incumbent vote share in the 2022 cross-section, with a relatively high R² (0.48) for a univariate model.
 
-## License
-
-Not specified — add a license file if you intend to share or reuse this code.
